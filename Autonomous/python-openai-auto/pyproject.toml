@@ -1,0 +1,13 @@
+[project]
+name = "python-openai-weather-agent"
+version = "1.0.0"
+description = "Autonomous weather agent — Python + OpenAI"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "openai>=1.30.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+]
+
