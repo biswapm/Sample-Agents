@@ -26,7 +26,7 @@ function createLLM(opts: Record<string, unknown> = {}): ChatOpenAI | AzureChatOp
 }
 
 export class WeatherAgent {
-  private llm: ReturnType<typeof createLLM> & { bindTools: Function };
+  private llm: ReturnType<ReturnType<typeof createLLM>["bindTools"]>;
   private history: Map<string, (HumanMessage | AIMessage)[]>;
 
   constructor() {
