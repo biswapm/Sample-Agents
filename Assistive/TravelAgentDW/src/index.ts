@@ -114,7 +114,11 @@ server.post('/api/messages', async (req: Request, res: Response) => {
 });
 
 const port = Number(process.env.PORT) || 3978;
-const host = '127.0.0.1';
+// Azure App Service (and any cloud host) sets WEBSITE_SITE_NAME and routes traffic
+// to the app through a front-end proxy — the app MUST listen on 0.0.0.0, not loopback,
+// or every request 502s. Locally we keep 127.0.0.1.
+const isProduction = Boolean(process.env.WEBSITE_SITE_NAME) || process.env.NODE_ENV === 'production';
+const host = isProduction ? '0.0.0.0' : '127.0.0.1';
 server.listen(port, host, () => {
   console.log(
     `\nServer listening on http://${host}:${port} ` +

@@ -35,6 +35,13 @@ function userKeysFor(from: any): string[] {
 export class TravelTeammateAgent extends AgentApplication<TurnState> {
   static authHandlerName = 'agentic';
 
+  // Varied acknowledgments — picked at random each turn so follow-ups don't feel robotic.
+  static ACKS = [
+    '✈️ On it — let me find the best options for you…',
+    'Looking into that now — give me a moment…',
+    'On it! Pulling together some options for you…',
+  ];
+
   constructor() {
     super({
       storage: new MemoryStorage(),
@@ -71,8 +78,6 @@ export class TravelTeammateAgent extends AgentApplication<TurnState> {
 
   async handleAgentMessageActivity(turnContext: TurnContext, state: TurnState): Promise<void> {
     console.log(`[MSG HANDLER] Entered handleAgentMessageActivity, text="${turnContext.activity.text?.slice(0, 60)}"`);
-    // Track conversation for proactive Word @mention replies
-    await this.trackConversationForProactive(turnContext);
     const userMessage = turnContext.activity.text?.trim() || '';
     const from = turnContext.activity?.from;
     const displayName = from?.name ?? 'unknown';
@@ -91,6 +96,14 @@ export class TravelTeammateAgent extends AgentApplication<TurnState> {
       console.log('[Word @mention] Detected Word @mention message');
     }
 
+    // Track the conversation for proactive DMs — ONLY for genuine 1:1 / personal turns.
+    // A Word @mention arrives on the wpx/agents channel, which is NOT a DM-able
+    // conversation; tracking it would overwrite the user's real 1:1 reference and
+    // break the proactive notification we send after replying to the comment.
+    if (!isWordMention) {
+      await this.trackConversationForProactive(turnContext);
+    }
+
     if (!userMessage) {
       await turnContext.sendActivity("Please send me a message and I'll help you!");
       return;
@@ -106,24 +119,12 @@ export class TravelTeammateAgent extends AgentApplication<TurnState> {
       .build();
 
     await baggageScope.run(async () => {
-      // For Word @mentions, sendActivity may fail (different reply URL format)
-      try {
-        await turnContext.sendActivity('Got it — working on it…');
-        await turnContext.sendActivity({ type: 'typing' } as Activity);
-      } catch (typingErr) {
-        console.warn('[Flow] Initial sendActivity failed (expected for Word @mentions):', (typingErr as any)?.message?.slice(0, 100));
-      }
-
-      let typingInterval: ReturnType<typeof setInterval> | undefined;
-      const startTypingLoop = () => {
-        typingInterval = setInterval(() => {
-          turnContext.sendActivity({ type: 'typing' } as Activity).catch(() => {});
-        }, 4000);
-      };
-      const stopTypingLoop = () => clearInterval(typingInterval);
-
-      startTypingLoop();
-
+      // A365 Observability — start the InvokeAgentScope FIRST (before any send) and
+      // publish its span context to turnState. The OutputLoggingMiddleware (enabled in
+      // index.ts via configureA365Hosting) reads turnState['A365ParentSpanId'] on each
+      // outbound message; setting it here links the ack + final response to this
+      // agent-invocation span instead of logging
+      // "No parent span ref in turnState under 'A365ParentSpanId'".
       const agentDetails: AgentDetails = {
         agentId: turnContext.activity?.recipient?.agenticAppId ?? process.env.agent365Observability__agentId ?? '',
         agentName: process.env.agent365Observability__agentName ?? 'TravelTeammate',
@@ -149,9 +150,31 @@ export class TravelTeammateAgent extends AgentApplication<TurnState> {
       let scope: InvokeAgentScope | null = null;
       try {
         scope = InvokeAgentScope.start(request, scopeDetails, agentDetails, callerDetails);
+        // Publish the parent span ref so OutputLoggingMiddleware can link outbound
+        // OutputScope spans to this invocation (SpanContext is a valid ParentSpanRef).
+        (turnContext.turnState as any).set('A365ParentSpanId', scope.getSpanContext());
       } catch (scopeErr) {
         console.error('[Scope] Failed to start scope:', scopeErr);
       }
+
+      // For Word @mentions, sendActivity may fail (different reply URL format)
+      try {
+        const ack = TravelTeammateAgent.ACKS[Math.floor(Math.random() * TravelTeammateAgent.ACKS.length)];
+        await turnContext.sendActivity(ack);
+        await turnContext.sendActivity({ type: 'typing' } as Activity);
+      } catch (typingErr) {
+        console.warn('[Flow] Initial sendActivity failed (expected for Word @mentions):', (typingErr as any)?.message?.slice(0, 100));
+      }
+
+      let typingInterval: ReturnType<typeof setInterval> | undefined;
+      const startTypingLoop = () => {
+        typingInterval = setInterval(() => {
+          turnContext.sendActivity({ type: 'typing' } as Activity).catch(() => {});
+        }, 4000);
+      };
+      const stopTypingLoop = () => clearInterval(typingInterval);
+
+      startTypingLoop();
 
       try {
         const doWork = async () => {
@@ -167,25 +190,37 @@ export class TravelTeammateAgent extends AgentApplication<TurnState> {
 
           // For Word @mentions, augment the prompt to use Word tools
           let effectiveMessage = userMessage;
+          let documentName = 'the document';
           if (isWordMention) {
             const attachments = (turnContext.activity as any)?.attachments ?? [];
             const fileAttachment = attachments.find((a: any) =>
               typeof a?.contentUrl === 'string' && /\.(docx?|doc)(\?|$)/i.test(a.contentUrl),
             ) ?? attachments[0];
             const documentUrl = fileAttachment?.contentUrl ?? '';
-            const documentName = fileAttachment?.name ?? 'the document';
+            documentName = fileAttachment?.name ?? 'the document';
             const cleanText = userMessage.replace(/<at>.*?<\/at>/gi, '').trim();
             const senderName = from?.name ?? 'a user';
 
+            // Comment/document IDs from the WpxComment notification (wire fields:
+            // commentId, parentCommentId, documentId). Passed as context so the model
+            // replies to the right comment without searching for it.
+            const wpx = entities.find((e: any) => /wpxcomment/i.test(e?.type ?? '')) ?? {};
+            const documentId = wpx.documentId ?? '';
+            const commentId = wpx.commentId ?? wpx.parentCommentId ?? '';
+            const idBlock =
+              (documentId ? `documentId: ${documentId}\n` : '') +
+              (commentId ? `commentId (reply to THIS comment): ${commentId}\n` : '');
+
             effectiveMessage =
-              `${senderName} @mentioned you on a comment in "${documentName}".\n` +
-              `Comment: ${cleanText}\n` +
+              `A user (${senderName}) @mentioned you on a comment in the Word document "${documentName}".\n` +
+              `Their comment: "${cleanText}"\n` +
               (documentUrl ? `Document URL: ${documentUrl}\n` : '') +
-              `Steps:\n` +
-              `1. ${documentUrl ? `Call mcp_WordServer.GetDocumentContent with the URL.` : 'Use the available Word/OneDrive tools to find and read the relevant document.'}\n` +
-              `2. Understand the comment and the document context.\n` +
-              `3. Use the Word REPLY tool (name contains "reply") to reply to the comment — NOT AddComment.\n` +
-              `4. Reply concisely and helpfully. Finish with: "Replied to the comment with: <your reply text>".`;
+              idBlock + `\n` +
+              `Do exactly this, using the FEWEST possible tool calls:\n` +
+              `1. Read the document ONCE via mcp_WordServer.GetDocumentContent (use the Document URL) — do NOT call it more than once.\n` +
+              `2. Reply to THAT comment with the Word REPLY tool (its name contains "reply"), using commentId above — never AddComment, never start a new thread.\n` +
+              `3. Keep the reply concise and directly useful. Do not call any other tools.\n` +
+              `End your final message with exactly: "Replied to the comment with: <the reply text you posted>".`;
             console.log('[Word @mention] Augmented prompt for Word tools');
           }
 
@@ -199,6 +234,29 @@ export class TravelTeammateAgent extends AgentApplication<TurnState> {
             console.log('[Response] Sent successfully');
           } catch (sendErr) {
             console.warn('[Response] sendActivity failed (expected for Word @mentions — response was delivered via MCP tools):', (sendErr as any)?.message?.slice(0, 100));
+          }
+
+          // Word @mention: the reply was posted on the comment via the MCP Word tool,
+          // but the user isn't watching the document — proactively DM them in Teams
+          // with the reply text. Uses the 1:1 conversation tracked from a prior direct
+          // message (looked up by any of the user's identifiers — aad / id / name).
+          if (isWordMention) {
+            try {
+              const convId = userKeysFor(from)
+                .map((k) => userKeyToConversationId.get(k))
+                .find(Boolean);
+              if (convId) {
+                const replyText = response?.match(/Replied to the comment with:\s*([\s\S]+)/i)?.[1]?.trim() || response;
+                await (this as any).proactive.sendActivity((this as any).adapter, convId, {
+                  text: `I replied to your comment on **${documentName}**:\n\n${replyText?.substring(0, 1500)}`,
+                });
+                console.log('[Word @mention] Proactive DM sent to user');
+              } else {
+                console.warn('[Word @mention] No tracked 1:1 conversation — cannot DM. Ask the user to message me directly once to enable Word notifications.');
+              }
+            } catch (dmErr) {
+              console.warn('[Word @mention] Proactive DM failed:', (dmErr as any)?.message?.slice(0, 120));
+            }
           }
         };
 
@@ -397,6 +455,20 @@ export class TravelTeammateAgent extends AgentApplication<TurnState> {
       await context.sendActivity(
         'Thank you for hiring me! I\'m your travel assistant — give me a destination and dates, and I\'ll find flights, hotels, and restaurants for you!'
       );
+
+      // MCP warm-up — connecting to the Word/OneDrive MCP servers costs ~6–10s and
+      // is normally paid on the user's FIRST message. We have a turn context + auth
+      // here at install time, so pre-build and cache the user's MCP agent now; their
+      // first real message then lands as a cache hit. Best-effort — if it fails the
+      // first message simply connects as before.
+      try {
+        const displayName = context.activity.from?.name ?? 'unknown';
+        const warmStart = Date.now();
+        await getClient(this.authorization, TravelTeammateAgent.authHandlerName, context, displayName);
+        console.log(`[MCP] Warm-up on install complete in ${Date.now() - warmStart}ms — first message will hit cache`);
+      } catch (warmErr) {
+        console.warn('[MCP] Warm-up on install failed (first message will connect normally):', (warmErr as any)?.message?.slice(0, 120));
+      }
     } else if (context.activity.action === 'remove') {
       await context.sendActivity('Thank you for your time, I enjoyed helping you plan trips!');
     }
